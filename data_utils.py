@@ -176,100 +176,109 @@ def create_dummy_data_for_month(num_countries=10, num_trades=20, exporter_feat_d
 
     return [trade_figs_df, exporters_features_df, importers_features_df, edge_attrs_df]
 
-def load_interactions_from_csv(csv_path):
+def load_interactions_from_csv(csv_path, static_user_feature_dim=32, static_event_feature_dim=64):
     """
     Loads interaction data from a CSV file.
-    Creates mappings for ip_address to user_id and item_id to item_id (integer).
+    Creates mappings for ip_address to user_id and pixel_event_id to event_id (integer).
+    Generates random static features for users and events.
     
     Args:
         csv_path (str): Path to the CSV file.
+        static_user_feature_dim (int): Dimension for randomly generated static user features.
+        static_event_feature_dim (int): Dimension for randomly generated static event features.
         
     Returns:
-        tuple: (interactions_df, user_mapping, item_mapping, 
-                num_unique_users, num_unique_items)
+        tuple: (interactions_df, user_mapping, event_mapping, 
+                user_feature_info, event_feature_info)
         interactions_df: DataFrame with original and mapped IDs.
         user_mapping: dict mapping ip_address to integer user_id.
-        item_mapping: dict mapping original item_id (string) to integer item_id.
+        event_mapping: dict mapping original pixel_event_id (string) to integer event_id.
+        user_feature_info (dict): {'num_unique': int, 'static_features': torch.Tensor}
+        event_feature_info (dict): {'num_unique': int, 'static_features': torch.Tensor}
     """
     print(f"Loading interaction data from {csv_path}...")
-    interactions_df = pd.read_csv(csv_path)
+    try:
+        interactions_df = pd.read_csv(csv_path)
+    except FileNotFoundError:
+        print(f"ERROR: Data file {csv_path} not found.")
+        raise
     
-    # Create user mapping (ip_address -> user_id)
+    if interactions_df.empty:
+        print("Warning: The CSV file is empty.")
+        user_feature_info = {'num_unique': 0, 'static_features': torch.empty(0, static_user_feature_dim)}
+        event_feature_info = {'num_unique': 0, 'static_features': torch.empty(0, static_event_feature_dim)}
+        return pd.DataFrame(), {}, {}, user_feature_info, event_feature_info
+
     unique_ips = interactions_df['ip_address'].unique()
     user_mapping = {ip: i for i, ip in enumerate(unique_ips)}
     interactions_df['user_id'] = interactions_df['ip_address'].map(user_mapping)
     num_unique_users = len(unique_ips)
     print(f"Found {num_unique_users} unique users (IPs).")
 
-    # Create item mapping (original item_id -> integer item_id)
-    unique_item_ids_csv = interactions_df['item_id'].unique() # Was pixel_event_id
-    item_mapping = {pid: i for i, pid in enumerate(unique_item_ids_csv)} # Was event_mapping
-    # The new integer mapped column will also be 'item_id', replacing original if it was string.
-    # If original 'item_id' from CSV could be integer, ensure this mapping is what's intended.
-    # For clarity, let's use a distinct mapped column name if needed, e.g., 'mapped_item_id',
-    # but current project uses same name for the mapped ID column (e.g. user_id).
-    interactions_df['item_id_mapped'] = interactions_df['item_id'].map(item_mapping) # Was event_id, using item_id from CSV
-    num_unique_items = len(unique_item_ids_csv) # Was num_unique_events
-    print(f"Found {num_unique_items} unique Item IDs.") # Was pixel event IDs
+    static_user_features = torch.randn(num_unique_users, static_user_feature_dim)
+    user_feature_info = {'num_unique': num_unique_users, 'static_features': static_user_features}
+
+    if 'pixel_event_id' not in interactions_df.columns:
+        raise ValueError("CSV file must contain 'pixel_event_id' column.")
+        
+    unique_event_ids_csv = interactions_df['pixel_event_id'].unique() 
+    event_mapping = {pid: i for i, pid in enumerate(unique_event_ids_csv)}
+    interactions_df['event_id'] = interactions_df['pixel_event_id'].map(event_mapping) 
+    num_unique_events = len(unique_event_ids_csv)
+    print(f"Found {num_unique_events} unique Event IDs (from pixel_event_id).")
+
+    static_event_features = torch.randn(num_unique_events, static_event_feature_dim)
+    event_feature_info = {'num_unique': num_unique_events, 'static_features': static_event_features}
     
-    # Sort by week and user for potentially easier processing later (optional)
     interactions_df = interactions_df.sort_values(by=['week_number', 'user_id']).reset_index(drop=True)
     
     print("Finished loading and mapping data.")
-    return interactions_df, user_mapping, item_mapping, num_unique_users, num_unique_items
+    return interactions_df, user_mapping, event_mapping, user_feature_info, event_feature_info
 
-def create_weekly_heterodata_from_df(week_df, num_total_users, num_total_items, 
-                                     user_features_static, item_features_static):
+def create_weekly_heterodata_from_df(week_df, global_user_map, global_event_map, 
+                                     user_features_static, event_features_static):
     """
     Creates a HeteroData object for a specific week from the interaction DataFrame.
-    Assumes week_df is a DataFrame filtered for a single week and contains mapped 'user_id' and 'item_id_mapped'.
-    User and Item features are provided externally (e.g., generated once).
+    Assumes week_df is a DataFrame filtered for a single week and contains mapped 'user_id' and 'event_id'.
+    User and Event features are provided externally (e.g., from load_interactions_from_csv).
 
     Args:
         week_df (pd.DataFrame): DataFrame of interactions for a single week.
-        num_total_users (int): Total number of unique users across all data.
-        num_total_items (int): Total number of unique items across all data. (Was num_total_events)
+        global_user_map (dict): Mapping from original user identifier to global integer ID.
+        global_event_map (dict): Mapping from original event identifier to global integer ID.
         user_features_static (torch.Tensor): Static features for all users.
-        item_features_static (torch.Tensor): Static features for all items. (Was event_features_static)
+        event_features_static (torch.Tensor): Static features for all events.
         
     Returns:
         HeteroData: Graph object for the week.
     """
     snapshot = HeteroData()
+    num_total_users = user_features_static.size(0)
+    num_total_events = event_features_static.size(0)
 
-    # Assign static node features
     snapshot['user'].x = user_features_static
     snapshot['user'].num_nodes = num_total_users
     
-    snapshot['item'].x = item_features_static # Was 'event'
-    snapshot['item'].num_nodes = num_total_items # Was 'event', num_total_events
+    snapshot['event'].x = event_features_static 
+    snapshot['event'].num_nodes = num_total_events
 
     if not week_df.empty:
-        # Edges (user -> item interactions)
-        # Columns 'user_id' and 'item_id_mapped' must exist and be mapped integer IDs
-        edge_index_user_item = torch.stack([
+        edge_index_user_event = torch.stack([
             torch.tensor(week_df['user_id'].values, dtype=torch.long),
-            torch.tensor(week_df['item_id_mapped'].values, dtype=torch.long) # Was 'event_id'
+            torch.tensor(week_df['event_id'].values, dtype=torch.long) 
         ], dim=0)
-
-        # Edge label (e.g., number of interactions)
-        # Ensure the column name for interaction count is correct (e.g., 'n_interactions')
-        edge_label = torch.tensor(week_df['n_interactions'].values, dtype=torch.float32) # Was 'n_events'
-
-        snapshot['user', 'interacts_with', 'item'].edge_index = edge_index_user_item # Was ('user', 'interacts_with', 'event')
-        snapshot['user', 'interacts_with', 'item'].edge_label = edge_label # Was ('user', 'interacts_with', 'event')
         
-        # Store edge_label_index for supervised learning, typically same as edge_index for link-level tasks
-        snapshot['user', 'interacts_with', 'item'].edge_label_index = edge_index_user_item.clone()
-    else:
-        # Ensure all expected keys are present even if no interactions
-        snapshot['user', 'interacts_with', 'item'].edge_index = torch.empty((2,0), dtype=torch.long)
-        snapshot['user', 'interacts_with', 'item'].edge_label = torch.empty((0,), dtype=torch.float32)
-        snapshot['user', 'interacts_with', 'item'].edge_label_index = torch.empty((2,0), dtype=torch.long)
+        snapshot['user', 'interacts_with', 'event'].edge_index = edge_index_user_event
 
-    # Optional: Convert to undirected if necessary, though for user-item it might be kept directed.
-    # If converting, be mindful of how edge attributes/labels are handled for reverse edges.
-    # snapshot = ToUndirected()(snapshot) 
+        if 'n_events' in week_df.columns:
+            edge_attr = torch.tensor(week_df['n_events'].values, dtype=torch.float).unsqueeze(1)
+            snapshot['user', 'interacts_with', 'event'].edge_attr = edge_attr
+        else:
+            pass 
+            
+    else: 
+        snapshot['user', 'interacts_with', 'event'].edge_index = torch.empty((2,0), dtype=torch.long)
+        snapshot['user', 'interacts_with', 'event'].edge_attr = torch.empty((0,1), dtype=torch.float)
 
     return snapshot
 

@@ -63,7 +63,7 @@ The primary goal is to model user-item interactions over time (weekly snapshots)
     *   Load the CSV data.
     *   Create weekly `HeteroData` graph snapshots.
     *   Initialize the `UserInteractionPredictor` model.
-    *   Train the model using an MSE loss on observed interaction counts for weeks 1-8.
+    *   Train the model using a `BCEWithLogitsLoss` for predicting the likelihood of user-item interactions (positive vs. negative samples) for weeks 1-8.
     *   Evaluate the model every 5 epochs by predicting Top-K items for users in week 9 and calculating Precision@K and Recall@K.
     *   Print details of the data being fed into the model for the first training step of each epoch.
 
@@ -125,8 +125,8 @@ The primary goal is to model user-item interactions over time (weekly snapshots)
 *   **Training Loop**:
     *   Iterates for a fixed number of `EPOCHS`.
     *   For each epoch, iterates through the dataset creating historical windows and target snapshots.
-    *   The model's `forward` pass is called to get predicted interaction scores for observed edges in the target snapshot.
-    *   An `nn.MSELoss` is computed between these predicted scores and the true `n_interactions` (interaction counts) from the target snapshot's `edge_label`.
+    *   The model's `forward` pass is called to get predicted scores for positive (observed) and negative (sampled) user-item pairs.
+    *   A `nn.BCEWithLogitsLoss` is computed between these predicted scores and the true labels (1 for positive, 0 for negative).
     *   Optimizer updates the model parameters.
 *   **Evaluation Loop (Top-K)**:
     *   Performed every 5 epochs, using week 9 as the validation set.
@@ -144,5 +144,5 @@ The primary goal is to model user-item interactions over time (weekly snapshots)
 *   **Dummy Dataset**: The project currently uses randomly generated data.
 *   **Static Node Features**: User and item node features are random and static (do not change over time). In a real-world scenario, these could be learned or derived from user/item attributes.
 *   **GNN for 'item' nodes only**: Due to the directed nature `user -> item`, the SAGEConv layer in the GNN primarily updates 'item' node representations. User node representations are passed through their initial features (possibly projected) and then processed.
-*   **Training Target**: The model is trained using MSE loss on the *count* of interactions for observed edges. The final goal is Top-K prediction, which uses a different output head (`user_to_item_scores_mlp`). This means the MSE training is a proxy task to learn useful GNN and Transformer representations.
+*   **Training Target**: The model is trained using `BCEWithLogitsLoss` on the *likelihood* of interaction, discriminating between observed (positive) and unobserved (negative) user-item pairs. The final goal is Top-K prediction, which uses a different output head (`user_to_item_scores_mlp`). This training approach helps learn useful GNN and Transformer representations for the ranking task.
 *   **Transformer Target**: The Transformer uses the user embeddings from the last historical step as the "target" for its decoder-like input, aiming to predict the next state of user embeddings.

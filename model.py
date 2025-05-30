@@ -1,199 +1,220 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv, to_hetero
+from torch_geometric.nn import SAGEConv
 import math
 
 class GNNEncoder(nn.Module):
-    """
-    Graph Neural Network Encoder using SAGEConv to generate static node embeddings.
-    This module is intended to be wrapped by `to_hetero` to handle heterogeneous graphs.
-    Its forward pass should ONLY contain the core GNN convolution.
-    Other operations like ReLU, Dropout, BatchNorm should be applied outside,
-    after `to_hetero` has processed the output.
-    """
-    def __init__(self, in_channels, hidden_channels, sage_aggr='mean'): # Removed unused params
-        super().__init__()
-        self.conv1 = SAGEConv((-1,-1), hidden_channels, aggr=sage_aggr)
+    def __init__(self, user_feature_dim, event_feature_dim, gnn_hidden_dim, num_gnn_layers, sage_aggr, sage_dropout_rate):
+        super(GNNEncoder, self).__init__()
+        self.num_gnn_layers = num_gnn_layers
+        self.sage_dropout_rate = sage_dropout_rate
 
-    def forward(self, x, edge_index, edge_attr=None):
-        """
-        Forward pass for a single homogeneous graph segment using SAGEConv.
-        Args:
-            x (Tensor): Node features.
-            edge_index (Tensor): Edge connectivity.
-            edge_attr (Tensor, optional): Edge features (ignored by SAGEConv).
-        Returns:
-            Tensor: Raw node embeddings after SAGEConv.
-        """
-        x_out = self.conv1(x, edge_index)
-        return x_out
+        self.user_convs = nn.ModuleList()
+        self.event_convs = nn.ModuleList()
+
+        self.user_initial_proj = nn.Linear(user_feature_dim, gnn_hidden_dim) if user_feature_dim != gnn_hidden_dim else None
+        self.event_initial_proj = nn.Linear(event_feature_dim, gnn_hidden_dim) if event_feature_dim != gnn_hidden_dim else None
+
+        for _ in range(num_gnn_layers):
+            self.user_convs.append(SAGEConv((-1, -1), gnn_hidden_dim, aggr=sage_aggr))
+            self.event_convs.append(SAGEConv((-1, -1), gnn_hidden_dim, aggr=sage_aggr))
+
+        self.user_bns = nn.ModuleList([nn.BatchNorm1d(gnn_hidden_dim) for _ in range(num_gnn_layers)])
+        self.event_bns = nn.ModuleList([nn.BatchNorm1d(gnn_hidden_dim) for _ in range(num_gnn_layers)])
+
+    def forward(self, x_user, x_event, edge_index):
+        if self.user_initial_proj:
+            x_user = self.user_initial_proj(x_user)
+        if self.event_initial_proj:
+            x_event = self.event_initial_proj(x_event)
+
+        for i in range(self.num_gnn_layers):
+            # Users are target, events are source. SAGEConv expects (x_src, x_dst), so (x_event, x_user)
+            # Edge index needs to be flipped for this: (event_idx, user_idx)
+            x_user_updated = self.user_convs[i]((x_event, x_user), edge_index[[1,0]])
+            x_user = self.user_bns[i](x_user_updated)
+            x_user = F.relu(x_user)
+            x_user = F.dropout(x_user, p=self.sage_dropout_rate, training=self.training)
+
+            # Events are target, users are source
+            x_event_updated = self.event_convs[i]((x_user, x_event), edge_index)
+            x_event = self.event_bns[i](x_event_updated)
+            x_event = F.relu(x_event)
+            x_event = F.dropout(x_event, p=self.sage_dropout_rate, training=self.training)
+            
+        return x_user, x_event
 
 class PositionalEncoding(nn.Module):
-    """
-    Standard Positional Encoding for Transformer.
-    Adds positional information to a sequence of embeddings.
-    """
-    def __init__(self, d_model, dropout=0.1, max_len=50):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
+    def __init__(self, d_model, max_len=50):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1) 
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        """
-        Args:
-            x (Tensor): Input tensor of shape [seq_len, batch_size (num_nodes), embedding_dim].
-        Returns:
-            Tensor: Output tensor with added positional encodings.
-        """
-        x = x + self.pe[:x.size(0), :] 
-        return self.dropout(x)
+        # x shape: [seq_len, batch_size (num_users), features (d_model)]
+        x = x + self.pe[:x.size(0), :]
+        return x
 
 class UserInteractionPredictor(nn.Module):
-    """
-    Model for predicting user-item interactions, aiming for Top-K recommendations.
-    Uses a SAGE-based GNN Encoder and a Transformer.
-    """
-    def __init__(self, metadata,
-                 user_feat_dim, item_feat_dim, 
-                 gnn_hidden_channels, 
-                 transformer_d_model, 
-                 tr_heads, tr_encoder_layers, tr_decoder_layers, 
-                 num_global_items, 
-                 sage_aggr='mean', sage_dropout_rate=0.1, gnn_momentum_bn=0.1,
-                 tr_dropout=0.1, 
-                 transformer_max_seq_len=50):
-        super().__init__()
+    def __init__(self, user_feature_dim, event_feature_dim,
+                 gnn_hidden_dim, num_gnn_layers, sage_aggr, sage_dropout_rate,
+                 transformer_d_model, transformer_nhead, transformer_num_layers, transformer_dropout,
+                 num_unique_users, num_global_events):
+        super(UserInteractionPredictor, self).__init__()
 
-        self.gnn_encoder_module = GNNEncoder(
-            in_channels=-1, 
-            hidden_channels=gnn_hidden_channels, 
-            sage_aggr=sage_aggr
-        )
-        self.gnn_encoder = to_hetero(self.gnn_encoder_module, metadata=metadata, aggr='sum')
-
-        self.user_feat_dim = user_feat_dim
-        self.item_feat_dim = item_feat_dim
-        self.gnn_hidden_channels = gnn_hidden_channels # Store for projection logic
-
-        if self.user_feat_dim != self.gnn_hidden_channels:
-            self.user_initial_proj = nn.Linear(self.user_feat_dim, self.gnn_hidden_channels)
-        else:
-            self.user_initial_proj = nn.Identity()
-
-        self.user_relu = nn.ReLU()
-        self.user_dropout = nn.Dropout(p=sage_dropout_rate)
-        self.user_bn = nn.BatchNorm1d(self.gnn_hidden_channels, momentum=gnn_momentum_bn)
+        self.gnn_encoder = GNNEncoder(user_feature_dim, event_feature_dim, gnn_hidden_dim,
+                                      num_gnn_layers, sage_aggr, sage_dropout_rate)
         
-        self.item_relu = nn.ReLU()
-        self.item_dropout = nn.Dropout(p=sage_dropout_rate)
-        self.item_bn = nn.BatchNorm1d(self.gnn_hidden_channels, momentum=gnn_momentum_bn)
-
-        if transformer_d_model != self.gnn_hidden_channels:
-            print(f"Warning: UserInteractionPredictor transformer_d_model ({transformer_d_model}) does not match gnn_hidden_channels ({self.gnn_hidden_channels}). Align or use projection.")
+        self.num_global_events = num_global_events
         self.transformer_d_model = transformer_d_model
+        self.gnn_hidden_dim = gnn_hidden_dim
 
-        self.pos_encoder = PositionalEncoding(self.transformer_d_model, dropout=tr_dropout, max_len=transformer_max_seq_len)
+        # Always use transformer components
+        self.gnn_to_transformer_proj = nn.Linear(gnn_hidden_dim, transformer_d_model) if gnn_hidden_dim != transformer_d_model else None
+        self.pos_encoder = PositionalEncoding(transformer_d_model)
+        encoder_layer_args = {
+            'd_model': transformer_d_model,
+            'nhead': transformer_nhead,
+            'dim_feedforward': transformer_d_model * 4,
+            'dropout': transformer_dropout,
+            'batch_first': False
+        }
+        try:
+            encoder_layers = nn.TransformerEncoderLayer(**encoder_layer_args, activation=F.gelu)
+        except TypeError:
+            encoder_layers = nn.TransformerEncoderLayer(**encoder_layer_args)
 
-        self.transformer = nn.Transformer(
-            d_model=self.transformer_d_model, 
-            nhead=tr_heads,
-            num_encoder_layers=tr_encoder_layers, 
-            num_decoder_layers=tr_decoder_layers,
-            dropout=tr_dropout, 
-            batch_first=False
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=transformer_num_layers)
+        
+        # Modified prediction head to use similarity
+        self.user_to_event_scores_mlp = nn.Linear(transformer_d_model + 1, 1)  # +1 for similarity score
+
+    def _get_embeddings_for_prediction(self, input_snapshots_for_gnn):
+        # Helper to run GNN and Transformer
+        all_user_gnn_embs_list = []
+        all_event_gnn_embs_list = []
+        
+        for snapshot_data in input_snapshots_for_gnn:
+            user_x = snapshot_data['user'].x
+            event_x = snapshot_data['event'].x
+            edge_idx = snapshot_data['user', 'interacts_with', 'event'].edge_index
+            current_user_gnn_emb, current_event_gnn_emb = self.gnn_encoder(user_x, event_x, edge_idx)
+            all_user_gnn_embs_list.append(current_user_gnn_emb)
+            all_event_gnn_embs_list.append(current_event_gnn_emb)
+        
+        if len(all_user_gnn_embs_list) < 2:
+            raise ValueError("Need at least 2 snapshots for transformer (history + target)")
+
+        # Process historical snapshots through transformer
+        user_embeddings_seq_hist = torch.stack(all_user_gnn_embs_list[:-1], dim=0)
+        if self.gnn_to_transformer_proj:
+            user_embeddings_seq_hist = self.gnn_to_transformer_proj(user_embeddings_seq_hist)
+        if self.pos_encoder:
+            user_embeddings_seq_hist = self.pos_encoder(user_embeddings_seq_hist)
+        
+        transformed_user_output = self.transformer_encoder(user_embeddings_seq_hist)
+        user_embeddings_for_prediction = transformed_user_output[-1, :, :]
+            
+        # Use the last event embeddings
+        event_embeddings_for_prediction = all_event_gnn_embs_list[-1]
+        
+        return user_embeddings_for_prediction, event_embeddings_for_prediction
+
+    def get_temporal_embeddings(self, input_snapshots):
+        """
+        Get temporal embeddings for both users and events.
+        Requires at least 2 snapshots (history + target).
+        """
+        if not input_snapshots:
+            raise ValueError("input_snapshots cannot be empty.")
+
+        if len(input_snapshots) < 2:
+            raise ValueError("Need at least 2 snapshots (history + target) for transformer")
+        
+        return self._get_embeddings_for_prediction(input_snapshots)
+
+    def _compute_similarity_scores(self, user_embeddings, event_embeddings, user_indices, event_indices):
+        # Get embeddings for the specified user-event pairs
+        user_embs = user_embeddings[user_indices]
+        event_embs = event_embeddings[event_indices]
+        
+        # Compute cosine similarity
+        similarity = F.cosine_similarity(user_embs, event_embs, dim=1)
+        
+        # Combine user embeddings with similarity scores
+        combined = torch.cat([user_embs, similarity.unsqueeze(1)], dim=1)
+        
+        # Get final scores
+        scores = self.user_to_event_scores_mlp(combined).squeeze()
+        
+        return scores
+
+    def forward(self, model_input_snapshots, positive_user_event_indices, negative_event_indices):
+        """
+        Forward pass for training.
+        
+        Args:
+            model_input_snapshots: List of HeteroData objects for historical weeks + target week
+            positive_user_event_indices: Dict with keys 'user' and 'event' containing indices of positive interactions
+            negative_event_indices: Dict with keys 'user' and 'event' containing indices of negative samples
+            
+        Returns:
+            Dict containing:
+                - positive_scores: Tensor of scores for positive user-event pairs
+                - negative_scores: Tensor of scores for negative user-event pairs
+        """
+        # Get user and event embeddings for prediction
+        user_embeddings, event_embeddings = self._get_embeddings_for_prediction(model_input_snapshots)
+        
+        # Get scores for positive and negative pairs
+        positive_scores = self._compute_similarity_scores(
+            user_embeddings, 
+            event_embeddings,
+            positive_user_event_indices['user'],
+            positive_user_event_indices['event']
         )
         
-        self.num_global_items = num_global_items
-        self.user_to_item_scores_mlp = nn.Linear(self.transformer_d_model, self.num_global_items)
-
-    def forward(self, historical_snapshots, target_snapshot_metadata_provider):
-        user_embeds_static_list = []
-        item_embeds_static_list = []
-
-        num_user_nodes_target = target_snapshot_metadata_provider['user'].num_nodes
-        num_item_nodes_target = target_snapshot_metadata_provider['item'].num_nodes
-
-        for snapshot in historical_snapshots:
-            x_dict = snapshot.x_dict
-            edge_index_dict = snapshot.edge_index_dict
-            
-            raw_z_dict_month = self.gnn_encoder(x_dict, edge_index_dict)
-            
-            # Handle user features
-            user_embeddings_from_gnn = raw_z_dict_month.get('user')
-            if user_embeddings_from_gnn is None:
-                if 'user' not in x_dict or x_dict['user'] is None:
-                    raise ValueError("GNN returned None for 'user' and no initial 'user' features in x_dict.")
-                initial_user_feat = x_dict['user']
-                user_feat_processed_gnn_stage = self.user_initial_proj(initial_user_feat)
-            else:
-                user_feat_processed_gnn_stage = user_embeddings_from_gnn
-            
-            user_feat = self.user_relu(user_feat_processed_gnn_stage)
-            user_feat = self.user_dropout(user_feat)
-            user_feat = self.user_bn(user_feat)
-            
-            # Handle item features (assuming GNN always outputs for 'item' as it's a dst_node_type)
-            item_feat_from_gnn = raw_z_dict_month['item']
-            item_feat = self.item_relu(item_feat_from_gnn)
-            item_feat = self.item_dropout(item_feat)
-            item_feat = self.item_bn(item_feat)
-
-            processed_z_dict_month = {'user': user_feat, 'item': item_feat}
-            
-            if processed_z_dict_month['user'].size(0) != num_user_nodes_target:
-                raise ValueError(f"User node count mismatch. Expected {num_user_nodes_target}, got {processed_z_dict_month['user'].size(0)}")
-            if processed_z_dict_month['item'].size(0) != num_item_nodes_target:
-                 raise ValueError(f"Item node count mismatch. Expected {num_item_nodes_target}, got {processed_z_dict_month['item'].size(0)}")
-
-            user_embeds_static_list.append(processed_z_dict_month['user'])
-            item_embeds_static_list.append(processed_z_dict_month['item'])
-
-        if not user_embeds_static_list or not item_embeds_static_list:
-            return torch.empty((0,), device=self.user_to_item_scores_mlp.weight.device if hasattr(self.user_to_item_scores_mlp, 'weight') else 'cpu')
-
-        user_static_seq = torch.stack(user_embeds_static_list, dim=0)
-        item_static_seq = torch.stack(item_embeds_static_list, dim=0)
-
-        user_src_for_transformer = self.pos_encoder(user_static_seq)
+        negative_scores = self._compute_similarity_scores(
+            user_embeddings,
+            event_embeddings,
+            negative_event_indices['user'],
+            negative_event_indices['event']
+        )
         
-        user_trg_for_decoder = user_embeds_static_list[-1].unsqueeze(0)
-        user_temporal_embeds_seq = self.transformer(user_src_for_transformer, user_trg_for_decoder)
-        user_temporal_embeds_flat = user_temporal_embeds_seq.squeeze(0)
-        item_embeds_for_prediction_time = item_embeds_static_list[-1]
+        return {
+            'positive_scores': positive_scores,
+            'negative_scores': negative_scores
+        }
 
-        if ('user', 'interacts_with', 'item') in target_snapshot_metadata_provider.edge_types and \
-            target_snapshot_metadata_provider['user', 'interacts_with', 'item'].edge_label_index.numel() > 0:
+    def predict_top_k_for_user(self, single_user_temporal_embedding, event_embeddings, k=5):
+        self.eval()
+        with torch.no_grad():
+            # Compute similarities for all events
+            similarities = F.cosine_similarity(
+                single_user_temporal_embedding.unsqueeze(0).expand(len(event_embeddings), -1),
+                event_embeddings,
+                dim=1
+            )
             
-            edge_label_index = target_snapshot_metadata_provider['user', 'interacts_with', 'item'].edge_label_index
-            src_user_indices = edge_label_index[0]
-            tgt_item_indices = edge_label_index[1]
-
-            user_embeds_for_observed = user_temporal_embeds_flat[src_user_indices]
-            item_embeds_for_observed = item_embeds_for_prediction_time[tgt_item_indices]
+            # Combine user embedding with similarities
+            combined = torch.cat([
+                single_user_temporal_embedding.unsqueeze(0).expand(len(event_embeddings), -1),
+                similarities.unsqueeze(1)
+            ], dim=1)
             
-            scores_for_observed_edges = (user_embeds_for_observed * item_embeds_for_observed).sum(dim=-1)
-            return scores_for_observed_edges
-        else:
-            return torch.empty((0,), device=user_temporal_embeds_flat.device)
-        
-    def predict_top_k_for_user(self, user_embedding, all_item_embeddings, k=5):
-        scores = self.user_to_item_scores_mlp(user_embedding)
-        
-        if scores.numel() == 0 :
-             return torch.empty((0,)), torch.empty((0,),dtype=torch.long), torch.empty((0,))
-
-        k_effective = min(k, scores.size(0))
-        if k_effective <= 0:
-            return torch.empty((scores.size(0),)), torch.empty((0,),dtype=torch.long), torch.empty((0,))
-
-        top_k_scores, top_k_indices = torch.topk(scores, k=k_effective)
-        return scores, top_k_indices, top_k_scores 
+            # Get scores for all events
+            event_scores = self.user_to_event_scores_mlp(combined).squeeze()
+            
+            # Get top-k events
+            actual_k = min(k, self.num_global_events)
+            if actual_k <= 0:
+                return [], []
+            
+            top_k_scores, top_k_indices = torch.topk(event_scores, actual_k)
+            return top_k_indices.tolist(), top_k_scores.tolist()
