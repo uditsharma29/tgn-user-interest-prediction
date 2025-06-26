@@ -235,50 +235,36 @@ def load_interactions_from_csv(csv_path, static_user_feature_dim=32, static_even
     print("Finished loading and mapping data.")
     return interactions_df, user_mapping, event_mapping, user_feature_info, event_feature_info
 
-def create_weekly_heterodata_from_df(week_df, global_user_map, global_event_map, 
-                                     user_features_static, event_features_static):
+def create_weekly_heterodata_from_df(week_df, user_features_static, event_features_static):
     """
     Creates a HeteroData object for a specific week from the interaction DataFrame.
-    Assumes week_df is a DataFrame filtered for a single week and contains mapped 'user_id' and 'event_id'.
-    User and Event features are provided externally (e.g., from load_interactions_from_csv).
+    This version creates both forward and reverse edges for compatibility with sampling.
 
     Args:
         week_df (pd.DataFrame): DataFrame of interactions for a single week.
-        global_user_map (dict): Mapping from original user identifier to global integer ID.
-        global_event_map (dict): Mapping from original event identifier to global integer ID.
         user_features_static (torch.Tensor): Static features for all users.
         event_features_static (torch.Tensor): Static features for all events.
-        
+    
     Returns:
-        HeteroData: Graph object for the week.
+        HeteroData: A graph object for the week with undirected edges.
     """
     snapshot = HeteroData()
-    num_total_users = user_features_static.size(0)
-    num_total_events = event_features_static.size(0)
 
+    # Assign node features and number of nodes
     snapshot['user'].x = user_features_static
-    snapshot['user'].num_nodes = num_total_users
+    snapshot['event'].x = event_features_static
+    snapshot['user'].num_nodes = user_features_static.size(0)
+    snapshot['event'].num_nodes = event_features_static.size(0)
     
-    snapshot['event'].x = event_features_static 
-    snapshot['event'].num_nodes = num_total_events
-
-    if not week_df.empty:
-        edge_index_user_event = torch.stack([
-            torch.tensor(week_df['user_id'].values, dtype=torch.long),
-            torch.tensor(week_df['event_id'].values, dtype=torch.long) 
-        ], dim=0)
-        
-        snapshot['user', 'interacts_with', 'event'].edge_index = edge_index_user_event
-
-        if 'n_events' in week_df.columns:
-            edge_attr = torch.tensor(week_df['n_events'].values, dtype=torch.float).unsqueeze(1)
-            snapshot['user', 'interacts_with', 'event'].edge_attr = edge_attr
-        else:
-            pass 
-            
-    else: 
-        snapshot['user', 'interacts_with', 'event'].edge_index = torch.empty((2,0), dtype=torch.long)
-        snapshot['user', 'interacts_with', 'event'].edge_attr = torch.empty((0,1), dtype=torch.float)
+    # Create forward edges
+    user_indices = torch.tensor(week_df['user_id'].values, dtype=torch.long)
+    event_indices = torch.tensor(week_df['event_id'].values, dtype=torch.long)
+    edge_index_user_to_event = torch.stack([user_indices, event_indices], dim=0)
+    
+    snapshot['user', 'interacts_with', 'event'].edge_index = edge_index_user_to_event
+    
+    # Create reverse edges for undirected graph representation
+    snapshot['event', 'rev_interacts_with', 'user'].edge_index = torch.stack([event_indices, user_indices], dim=0)
 
     return snapshot
 
@@ -302,8 +288,6 @@ if __name__ == '__main__':
         if not week_1_df.empty:
             hetero_snapshot_week_1 = create_weekly_heterodata_from_df(
                 week_1_df, 
-                n_users, 
-                n_items, 
                 static_user_features,
                 static_item_features
             )
